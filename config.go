@@ -14,6 +14,9 @@ type Config struct {
 	HTTPAddr      string
 	DBPath        string
 	Recipients    map[string]struct{}
+	POP3Enable    bool
+	POP3Addr      string
+	POP3Password  string
 	MaxConns      int
 	ReadTimeout   time.Duration
 	MaxLineBytes  int
@@ -69,8 +72,32 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("limits must be positive")
 	}
 
+	pop3Enable := false
+	if value := os.Getenv("POP3_ENABLE"); value != "" {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			pop3Enable = true
+		case "0", "false", "no", "off":
+		default:
+			return Config{}, fmt.Errorf("POP3_ENABLE: invalid boolean %q", value)
+		}
+	}
+	pop3Addr := getenv("POP3_ADDR", "127.0.0.1:1100")
+	pop3Password := os.Getenv("POP3_PASSWORD")
+	if pop3Enable {
+		if err := validateLoopbackAddr(pop3Addr); err != nil {
+			return Config{}, fmt.Errorf("POP3_ADDR: %w", err)
+		}
+		if pop3Password == "" {
+			return Config{}, fmt.Errorf("POP3_PASSWORD must be set when POP3_ENABLE is true")
+		}
+	}
+
 	return Config{
 		SMTPAddr:      smtpAddr,
+		POP3Enable:    pop3Enable,
+		POP3Addr:      pop3Addr,
+		POP3Password:  pop3Password,
 		HTTPAddr:      httpAddr,
 		DBPath:        getenv("DB_PATH", "mail.db"),
 		Recipients:    recipients,

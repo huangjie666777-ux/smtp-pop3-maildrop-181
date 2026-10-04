@@ -197,6 +197,49 @@ func (s *Store) recipientsFor(ctx context.Context, id string) ([]string, error) 
 	return recipients, rows.Err()
 }
 
+type MessageRef struct {
+	ID   string
+	Size int
+}
+
+func (s *Store) ListIDsForRecipient(ctx context.Context, recipient string) ([]MessageRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT m.id, length(m.raw)
+FROM messages m
+JOIN message_recipients r ON r.message_id = m.id
+WHERE r.recipient = ?
+ORDER BY m.received_at ASC, m.id ASC`, recipient)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	refs := make([]MessageRef, 0)
+	for rows.Next() {
+		var ref MessageRef
+		if err := rows.Scan(&ref.ID, &ref.Size); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
+func (s *Store) DeleteForRecipient(ctx context.Context, recipient string, ids []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM message_recipients WHERE message_id = ? AND recipient = ?`,
+			id, recipient); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func newMessageID() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {

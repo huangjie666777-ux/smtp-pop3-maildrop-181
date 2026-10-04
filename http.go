@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 
 	"github.com/go-chi/chi/v5"
@@ -82,6 +83,9 @@ type httpHandlers struct {
 
 func (h *httpHandlers) recipient(w http.ResponseWriter, r *http.Request) (string, bool) {
 	raw := chi.URLParam(r, "recipient")
+	if unescaped, err := url.PathUnescape(raw); err == nil {
+		raw = unescaped
+	}
 	canonical, err := CanonicalRecipient(raw)
 	if err != nil {
 		http.Error(w, "invalid recipient", http.StatusBadRequest)
