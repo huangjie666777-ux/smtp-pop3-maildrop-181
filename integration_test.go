@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,12 +21,72 @@ func testConfig(t *testing.T) Config {
 		SMTPAddr:      "127.0.0.1:0",
 		HTTPAddr:      "127.0.0.1:0",
 		DBPath:        filepath.Join(t.TempDir(), "mail.db"),
-		Recipients:    map[string]struct{}{"user.Name@example.com": {}},
+		Recipients:    map[string]struct{}{"user.Name@example.com": {}, "other@example.com": {}, "outsider@example.com": {}},
 		MaxConns:      4,
 		ReadTimeout:   2 * time.Second,
 		MaxLineBytes:  200,
 		MaxRecipients: 3,
 		MaxMailBytes:  512,
+		POP3Enabled:   true,
+		POP3Addr:      "127.0.0.1:0",
+		POP3Password:  "secret",
+	}
+}
+
+func dialPOP3Server(t *testing.T, config Config, store *Store) (*POP3Server, net.Conn, *bufio.Reader) {
+	t.Helper()
+	server := NewPOP3Server(config, store)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	})
+	conn, err := net.Dial("tcp", server.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	reader := bufio.NewReader(conn)
+	greeting := readPOP3Line(t, reader)
+	if greeting != "+OK POP3 service ready" {
+		t.Fatalf("greeting=%q", greeting)
+	}
+	return server, conn, reader
+}
+
+func readPOP3Line(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+	line, err := reader.ReadString('\n')
+	if err != nil || !strings.HasSuffix(line, "\r\n") {
+		t.Fatalf("line=%q err=%v", line, err)
+	}
+	return strings.TrimSuffix(line, "\r\n")
+}
+
+func pop3Request(t *testing.T, conn net.Conn, reader *bufio.Reader, command string) string {
+	t.Helper()
+	if _, err := io.WriteString(conn, command+"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	return readPOP3Line(t, reader)
+}
+
+func pop3Multiline(t *testing.T, conn net.Conn, reader *bufio.Reader, command string) []string {
+	t.Helper()
+	first := pop3Request(t, conn, reader, command)
+	if !strings.HasPrefix(first, "+OK") {
+		t.Fatalf("command=%q first=%q", command, first)
+	}
+	var lines []string
+	for {
+		line := readPOP3Line(t, reader)
+		if line == "." {
+			return lines
+		}
+		lines = append(lines, strings.TrimPrefix(line, "."))
 	}
 }
 
@@ -88,7 +150,7 @@ func TestSMTPReceiptAndHTTPRetrieval(t *testing.T) {
 
 	sendSMTP(t, conn, reader, "503", "RCPT TO:<user.Name@Example.COM>\r\n")
 	sendSMTP(t, conn, reader, "250", "MAIL FROM:<>\r\n")
-	sendSMTP(t, conn, reader, "550", "RCPT TO:<other@example.com>\r\n")
+	sendSMTP(t, conn, reader, "550", "RCPT TO:<unknown@example.com>\r\n")
 	sendSMTP(t, conn, reader, "250", "RCPT TO:<user.Name@Example.COM>\r\n")
 	sendSMTP(t, conn, reader, "250", "RCPT TO:<user.Name@example.com>\r\n")
 	sendSMTP(t, conn, reader, "250", "RSET\r\nEHLO client.example\r\nMAIL FROM:<sender@example.org>\r\nRCPT TO:<user.Name@Example.COM>\r\nDATA\r\n")
@@ -247,5 +309,181 @@ func TestSMTPOptionalMailParameters(t *testing.T) {
 	empty, err := parseReversePath("FROM:<>")
 	if err != nil || empty != "" {
 		t.Fatalf("empty sender=%q err=%v", empty, err)
+	}
+}
+
+func TestPOP3WorkflowDeletionLockRestartAndSharedRecipient(t *testing.T) {
+	config := testConfig(t)
+	store, err := NewStore(config.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	first := "Subject: first\r\n\r\n..dot\r\n"
+	second := "Subject: second\r\n\r\nshared\r\n"
+	saved1, err := store.Save(context.Background(), "sender@example.org", []string{"user.Name@example.com", "other@example.com"}, []byte(first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved2, err := store.Save(context.Background(), "sender@example.org", []string{"user.Name@example.com"}, []byte(second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, conn, reader := dialPOP3Server(t, config, store)
+	if reply := pop3Request(t, conn, reader, "STAT"); !strings.HasPrefix(reply, "-ERR") {
+		t.Fatalf("STAT before auth=%q", reply)
+	}
+	if reply := pop3Request(t, conn, reader, "USER user.Name@Example.COM"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+	if reply := pop3Request(t, conn, reader, "PASS wrong"); !strings.HasPrefix(reply, "-ERR") {
+		t.Fatal(reply)
+	}
+	if reply := pop3Request(t, conn, reader, "PASS secret"); !strings.HasPrefix(reply, "+OK maildrop locked, 2") {
+		t.Fatal(reply)
+	}
+
+	_, conn2, reader2 := dialPOP3Server(t, config, store)
+	if reply := pop3Request(t, conn2, reader2, "USER user.Name@example.com"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+	if reply := pop3Request(t, conn2, reader2, "PASS secret"); !strings.Contains(reply, "in use") {
+		t.Fatalf("second lock=%q", reply)
+	}
+	if reply := pop3Request(t, conn2, reader2, "QUIT"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+
+	if reply := pop3Request(t, conn, reader, "STAT"); reply != "+OK 2 "+strconv.Itoa(len(first)+len(second)) {
+		t.Fatalf("STAT=%q", reply)
+	}
+	list := pop3Multiline(t, conn, reader, "LIST")
+	if len(list) != 2 || list[0] != "1 "+strconv.Itoa(len(first)) || list[1] != "2 "+strconv.Itoa(len(second)) {
+		t.Fatalf("LIST=%#v", list)
+	}
+	uidls := pop3Multiline(t, conn, reader, "UIDL")
+	if len(uidls) != 2 {
+		t.Fatalf("UIDL=%#v", uidls)
+	}
+	id1 := strings.TrimPrefix(uidls[0], "1 ")
+	id2 := strings.TrimPrefix(uidls[1], "2 ")
+	if id1 != saved1 || id2 != saved2 {
+		t.Fatalf("UIDL=%q %q, saved=%q %q", id1, id2, saved1, saved2)
+	}
+
+	retrieved := pop3Multiline(t, conn, reader, "RETR 1")
+	if strings.Join(retrieved, "\r\n") != "Subject: first\r\n\r\n..dot" {
+		t.Fatalf("RETR=%#v", retrieved)
+	}
+	if reply := pop3Request(t, conn, reader, "DELE 1"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+	if reply := pop3Request(t, conn, reader, "LIST 1"); !strings.HasPrefix(reply, "-ERR") {
+		t.Fatalf("deleted LIST=%q", reply)
+	}
+	if reply := pop3Request(t, conn, reader, "STAT"); reply != "+OK 1 "+strconv.Itoa(len(second)) {
+		t.Fatalf("deleted STAT=%q", reply)
+	}
+	if reply := pop3Request(t, conn, reader, "RSET"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+	if reply := pop3Request(t, conn, reader, "STAT"); reply != "+OK 2 "+strconv.Itoa(len(first)+len(second)) {
+		t.Fatalf("RSET STAT=%q", reply)
+	}
+	if reply := pop3Request(t, conn, reader, "DELE 1"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+	if reply := pop3Request(t, conn, reader, "QUIT"); !strings.HasPrefix(reply, "+OK") {
+		t.Fatal(reply)
+	}
+	conn.Close()
+
+	messages, err := store.ListByRecipient(context.Background(), "user.Name@example.com")
+	if err != nil || len(messages) != 1 || messages[0].ID != id2 {
+		t.Fatalf("primary messages=%#v err=%v", messages, err)
+	}
+	shared, err := store.ListByRecipient(context.Background(), "other@example.com")
+	if err != nil || len(shared) != 1 || shared[0].ID != id1 {
+		t.Fatalf("shared messages=%#v err=%v", shared, err)
+	}
+
+	store.Close()
+	reopened, err := NewStore(config.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted, err := reopened.ListByRecipient(context.Background(), "user.Name@example.com")
+	if err != nil || len(restarted) != 1 || restarted[0].ID != id2 {
+		t.Fatalf("restart messages=%#v err=%v", restarted, err)
+	}
+}
+
+func TestPOP3PipeliningAndDisconnectDoesNotDelete(t *testing.T) {
+	config := testConfig(t)
+	store, err := NewStore(config.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	raw := []byte("Subject: pipe\r\n\r\nbody\r\n")
+	if _, err := store.Save(context.Background(), "sender@example.org", []string{"other@example.com"}, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	_, conn, reader := dialPOP3Server(t, config, store)
+	if _, err := io.WriteString(conn, "USER other@example.com\r\nPASS secret\r\nDELE 1\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"+OK", "+OK maildrop locked", "+OK"} {
+		if line := readPOP3Line(t, reader); !strings.HasPrefix(line, prefix) {
+			t.Fatalf("line=%q prefix=%q", line, prefix)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	messages, err := store.ListByRecipient(context.Background(), "other@example.com")
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("messages=%#v err=%v", messages, err)
+	}
+}
+
+func TestHTTPAcceptsEncodedRecipientAndDuplicateRCPTAfterLimit(t *testing.T) {
+	config := testConfig(t)
+	config.MaxRecipients = 1
+	store, err := NewStore(config.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if _, err := store.Save(context.Background(), "sender@example.org", []string{"user.Name@example.com"}, []byte("Subject: x\r\n\r\nx\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	httpServer := NewHTTPServer(config, store)
+	testHTTP := httptest.NewServer(httpServer.server.Handler)
+	defer testHTTP.Close()
+	encoded := url.PathEscape("user.Name@Example.COM")
+	response, err := testHTTP.Client().Get(testHTTP.URL + "/api/recipients/" + encoded + "/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatalf("encoded status=%d", response.StatusCode)
+	}
+
+	_, conn, reader := dialSMTPServer(t, config, store)
+	if _, err := io.WriteString(conn, "EHLO client.example\r\nMAIL FROM:<sender@example.org>\r\nRCPT TO:<user.Name@Example.COM>\r\nRCPT TO:<user.Name@example.com>\r\nRCPT TO:<other@example.com>\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"250-", "250 ", "250", "250", "250", "452"} {
+		line, err := reader.ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, want) {
+			t.Fatalf("line=%q want=%s err=%v", line, want, err)
+		}
 	}
 }

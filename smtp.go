@@ -181,9 +181,6 @@ func (s *SMTPServer) handle(conn net.Conn) {
 					reply = "503 send HELO first"
 				} else if !session.senderSet {
 					reply = "503 send MAIL first"
-				} else if len(session.recipients) >= s.config.MaxRecipients {
-					reply = "452 too many recipients"
-					fatal = true
 				} else {
 					address, err := parseForwardPath(arguments)
 					if err != nil {
@@ -196,6 +193,8 @@ func (s *SMTPServer) handle(conn net.Conn) {
 							reply = "550 recipient not allowed"
 						} else if containsString(session.recipients, canonical) {
 							reply = "250 duplicate recipient ignored"
+						} else if len(session.recipients) >= s.config.MaxRecipients {
+							reply = "452 too many recipients"
 						} else {
 							session.recipients = append(session.recipients, canonical)
 							reply = "250 recipient OK"

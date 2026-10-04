@@ -5,6 +5,9 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -23,8 +26,23 @@ type StoredMessage struct {
 	Raw []byte `json:"-"`
 }
 
+type MaildropMessage struct {
+	ID   string
+	Size int
+}
+
 type Store struct {
-	db *sql.DB
+	db    *sql.DB
+	locks sync.Map
+}
+
+func (s *Store) TryLockMaildrop(recipient string) bool {
+	_, loaded := s.locks.LoadOrStore(recipient, struct{}{})
+	return !loaded
+}
+
+func (s *Store) UnlockMaildrop(recipient string) {
+	s.locks.Delete(recipient)
 }
 
 func NewStore(path string) (*Store, error) {
@@ -177,6 +195,66 @@ WHERE m.id = ?`, recipient, id).
 		return StoredMessage{}, false, err
 	}
 	return stored, true, nil
+}
+
+func (s *Store) MaildropSnapshot(ctx context.Context, recipient string) ([]MaildropMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT m.id, length(m.raw)
+FROM messages m
+JOIN message_recipients r ON r.message_id = m.id
+WHERE r.recipient = ?
+ORDER BY m.received_at ASC, m.id ASC`, recipient)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	messages := make([]MaildropMessage, 0)
+	for rows.Next() {
+		var message MaildropMessage
+		if err := rows.Scan(&message.ID, &message.Size); err != nil {
+			return nil, err
+		}
+		if !validMessageID(message.ID) {
+			return nil, fmt.Errorf("invalid message id in database")
+		}
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
+func (s *Store) DeleteForRecipient(ctx context.Context, recipient string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, recipient)
+	placeholders := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !validMessageID(id) {
+			return fmt.Errorf("invalid message id")
+		}
+		args = append(args, id)
+		placeholders = append(placeholders, "?")
+	}
+	statement := `
+DELETE FROM message_recipients
+WHERE recipient = ? AND message_id IN (` + strings.Join(placeholders, ",") + `)`
+	if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM messages
+WHERE id IN (`+strings.Join(placeholders, ",")+`)
+AND NOT EXISTS (SELECT 1 FROM message_recipients WHERE message_id = messages.id)`, args[1:]...); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) recipientsFor(ctx context.Context, id string) ([]string, error) {

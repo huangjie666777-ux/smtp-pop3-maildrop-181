@@ -12,7 +12,10 @@ import (
 type Config struct {
 	SMTPAddr      string
 	HTTPAddr      string
+	POP3Enabled   bool
+	POP3Addr      string
 	DBPath        string
+	POP3Password  string
 	Recipients    map[string]struct{}
 	MaxConns      int
 	ReadTimeout   time.Duration
@@ -24,11 +27,21 @@ type Config struct {
 func LoadConfig() (Config, error) {
 	smtpAddr := getenv("SMTP_ADDR", "127.0.0.1:2525")
 	httpAddr := getenv("HTTP_ADDR", "127.0.0.1:8080")
+	pop3Enabled := strings.EqualFold(getenv("POP3_ENABLED", "false"), "true")
+	pop3Addr := getenv("POP3_ADDR", "127.0.0.1:1100")
 	if err := validateLoopbackAddr(smtpAddr); err != nil {
 		return Config{}, fmt.Errorf("SMTP_ADDR: %w", err)
 	}
 	if err := validateLoopbackAddr(httpAddr); err != nil {
 		return Config{}, fmt.Errorf("HTTP_ADDR: %w", err)
+	}
+	if pop3Enabled {
+		if err := validateLoopbackAddr(pop3Addr); err != nil {
+			return Config{}, fmt.Errorf("POP3_ADDR: %w", err)
+		}
+		if os.Getenv("POP3_PASSWORD") == "" {
+			return Config{}, fmt.Errorf("POP3_PASSWORD must be set when POP3_ENABLED=true")
+		}
 	}
 
 	allowedText := os.Getenv("ALLOWED_RECIPIENTS")
@@ -72,7 +85,10 @@ func LoadConfig() (Config, error) {
 	return Config{
 		SMTPAddr:      smtpAddr,
 		HTTPAddr:      httpAddr,
+		POP3Enabled:   pop3Enabled,
+		POP3Addr:      pop3Addr,
 		DBPath:        getenv("DB_PATH", "mail.db"),
+		POP3Password:  os.Getenv("POP3_PASSWORD"),
 		Recipients:    recipients,
 		MaxConns:      maxConns,
 		ReadTimeout:   time.Duration(readTimeoutSeconds) * time.Second,

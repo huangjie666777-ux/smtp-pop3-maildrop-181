@@ -23,9 +23,18 @@ func main() {
 	if err := smtpServer.Start(); err != nil {
 		log.Fatalf("SMTP listen: %v", err)
 	}
+	var pop3Server *POP3Server
+	if config.POP3Enabled {
+		pop3Server = NewPOP3Server(config, store)
+		if err := pop3Server.Start(); err != nil {
+			log.Fatalf("POP3 listen: %v", err)
+		}
+	}
 	httpServer := NewHTTPServer(config, store)
 	httpErr := make(chan error, 1)
-	go func() { httpErr <- httpServer.ListenAndServe() }()
+	go func() {
+		httpErr <- httpServer.ListenAndServe()
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -44,5 +53,10 @@ func main() {
 	}
 	if err := smtpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("SMTP shutdown: %v", err)
+	}
+	if pop3Server != nil {
+		if err := pop3Server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("POP3 shutdown: %v", err)
+		}
 	}
 }
